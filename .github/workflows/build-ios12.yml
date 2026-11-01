@@ -131,11 +131,12 @@ jobs:
                   return unsafeBitCast(sym, to: VibeFn.self)
               }()
               private static var last: CFAbsoluteTime = 0
-              // ms: motor on-time, intensity: 0.0-1.0. Pulses closer than 50ms are skipped.
+              // ms: motor on-time, intensity: 0.0-1.0. Pulses closer than 80ms are skipped.
               static func pulse(ms: Int, intensity: Double) {
                   let now = CFAbsoluteTimeGetCurrent()
-                  if now - last < 0.05 { return }
+                  if now - last < 0.08 { return }
                   last = now
+                  NSLog("DankPod: vibe %ldms api=%@", ms, (fn == nil ? "missing" : "ok") as NSString)
                   guard let fn = fn else { return }
                   let pattern: NSDictionary = ["VibePattern": [true, ms] as [Any], "Intensity": intensity]
                   fn(4095, nil, pattern)
@@ -144,7 +145,7 @@ jobs:
 
           final class UISelectionFeedbackGenerator {
               func prepare() {}
-              func selectionChanged() { LegacyVibe.pulse(ms: 20, intensity: 0.5) }
+              func selectionChanged() { LegacyVibe.pulse(ms: 40, intensity: 1.0) }
           }
 
           final class UIImpactFeedbackGenerator {
@@ -154,9 +155,9 @@ jobs:
               func prepare() {}
               func impactOccurred() {
                   switch style {
-                  case .light:  LegacyVibe.pulse(ms: 30, intensity: 0.7)
-                  case .medium: LegacyVibe.pulse(ms: 40, intensity: 0.85)
-                  case .heavy:  LegacyVibe.pulse(ms: 60, intensity: 1.0)
+                  case .light:  LegacyVibe.pulse(ms: 60, intensity: 1.0)
+                  case .medium: LegacyVibe.pulse(ms: 80, intensity: 1.0)
+                  case .heavy:  LegacyVibe.pulse(ms: 100, intensity: 1.0)
                   }
               }
           }
