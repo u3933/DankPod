@@ -1,0 +1,204 @@
+name: Build DankPod for iOS 12
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Xcode 15.x (the last Xcode that can target iOS 12) exists only on macOS 14 runners.
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode 15
+        run: |
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_15*.app | sort -V | tail -1)
+          echo "Using $XC"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+      - name: Patch sources for iOS 12
+        run: |
+          cat > /tmp/patch_ios12.py << 'PATCH_EOF'
+          #!/usr/bin/env python3
+          """iOS 12 (iPhone 5s) 向けパッチ。リポジトリのルートで実行する。
+          - MusicKit(iOS 15+) を使う「Made For You」機能を IOS12 ビルドでは除外
+          - 検索アイコン(SF Symbols, iOS 13+) に iOS 12 用の代替描画を追加
+          パターンが見つからなければ失敗させる（黙って素通りしない）。"""
+          import sys, pathlib
+
+          root = pathlib.Path("DankPod")
+          errors = []
+
+          def wrap_whole_file(rel):
+              p = root / rel
+              s = p.read_text()
+              if s.startswith("#if !IOS12"):
+                  return
+              p.write_text("#if !IOS12\n" + s + "\n#endif\n")
+              print(f"wrapped: {rel}")
+
+          def replace_once(rel, old, new):
+              p = root / rel
+              s = p.read_text()
+              if new in s:
+                  print(f"already patched: {rel}")
+                  return
+              if s.count(old) != 1:
+                  errors.append(f"{rel}: pattern found {s.count(old)} times (expected 1)")
+                  return
+              p.write_text(s.replace(old, new))
+              print(f"patched: {rel}")
+
+          for f in ["MusicKitService.swift",
+                    "Screens/MadeForYouViewController.swift",
+                    "Screens/MadeForYouSongsViewController.swift"]:
+              wrap_whole_file(f)
+
+          replace_once("Screens/MusicViewController.swift",
+          """        if #available(iOS 16.0, *) {
+                      // Insert after "Recently Played" (index 2)
+                      menuItems.insert("Made For You", at: 2)
+                      vcs.insert(MadeForYouViewController(), at: 2)
+                  }""",
+          """        #if !IOS12
+                  if #available(iOS 16.0, *) {
+                      // Insert after "Recently Played" (index 2)
+                      menuItems.insert("Made For You", at: 2)
+                      vcs.insert(MadeForYouViewController(), at: 2)
+                  }
+                  #endif""")
+
+          replace_once("Screens/SearchViewController.swift",
+          """            if #available(iOS 13.0, *) {
+                          iconView.image = UIImage(systemName: "magnifyingglass")
+                      }""",
+          """            if #available(iOS 13.0, *) {
+                          iconView.image = UIImage(systemName: "magnifyingglass")
+                      } else {
+                          // iOS 12: draw a simple search icon
+                          UIGraphicsBeginImageContextWithOptions(CGSize(width: 16, height: 16), false, 0)
+                          if let ctx = UIGraphicsGetCurrentContext() {
+                              ctx.setStrokeColor(UIColor.gray.cgColor)
+                              ctx.setLineWidth(1.5)
+                              ctx.addEllipse(in: CGRect(x: 1, y: 1, width: 9, height: 9))
+                              ctx.strokePath()
+                              ctx.move(to: CGPoint(x: 9.5, y: 9.5))
+                              ctx.addLine(to: CGPoint(x: 14, y: 14))
+                              ctx.strokePath()
+                          }
+                          iconView.image = UIGraphicsGetImageFromCurrentImageContext()?.withRenderingMode(.alwaysTemplate)
+                          UIGraphicsEndImageContext()
+                      }""")
+
+          replace_once("AppDelegate.swift",
+          """import UIKit
+
+          @UIApplicationMain""",
+          """import UIKit
+          import MediaPlayer
+
+          @UIApplicationMain""")
+
+          replace_once("AppDelegate.swift",
+          """        AppDelegate.music = Music()""",
+          """        // Ask for Media Library access (DankPod never requested it, so iOS 12 returns nothing)
+                  if MPMediaLibrary.authorizationStatus() == .notDetermined {
+                      MPMediaLibrary.requestAuthorization { status in
+                          NSLog("DankPod: media library authorization = %ld", status.rawValue)
+                      }
+                  }
+                  AppDelegate.music = Music()""")
+
+          # iPhone 5s has no Taptic Engine: UIFeedbackGenerator is silent there.
+          # Shadow UIKit's generator classes inside the module and drive the classic
+          # vibration motor via the private AudioServicesPlaySystemSoundWithVibration.
+          HAPTICS = """
+
+          #if IOS12
+          enum LegacyVibe {
+              private typealias VibeFn = @convention(c) (UInt32, AnyObject?, NSDictionary) -> Void
+              private static let fn: VibeFn? = {
+                  _ = dlopen("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox", RTLD_LAZY)
+                  guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "AudioServicesPlaySystemSoundWithVibration") else {
+                      NSLog("DankPod: vibration API not found")
+                      return nil
+                  }
+                  return unsafeBitCast(sym, to: VibeFn.self)
+              }()
+              private static var last: CFAbsoluteTime = 0
+              // ms: motor on-time, intensity: 0.0-1.0. Pulses closer than 50ms are skipped.
+              static func pulse(ms: Int, intensity: Double) {
+                  let now = CFAbsoluteTimeGetCurrent()
+                  if now - last < 0.05 { return }
+                  last = now
+                  guard let fn = fn else { return }
+                  let pattern: NSDictionary = ["VibePattern": [true, ms] as [Any], "Intensity": intensity]
+                  fn(4095, nil, pattern)
+              }
+          }
+
+          final class UISelectionFeedbackGenerator {
+              func prepare() {}
+              func selectionChanged() { LegacyVibe.pulse(ms: 20, intensity: 0.5) }
+          }
+
+          final class UIImpactFeedbackGenerator {
+              enum FeedbackStyle { case light, medium, heavy }
+              private let style: FeedbackStyle
+              init(style: FeedbackStyle) { self.style = style }
+              func prepare() {}
+              func impactOccurred() {
+                  switch style {
+                  case .light:  LegacyVibe.pulse(ms: 30, intensity: 0.7)
+                  case .medium: LegacyVibe.pulse(ms: 40, intensity: 0.85)
+                  case .heavy:  LegacyVibe.pulse(ms: 60, intensity: 1.0)
+                  }
+              }
+          }
+          #endif
+          """
+          g = root / "Globals.swift"
+          gs = g.read_text()
+          if "enum LegacyVibe" not in gs:
+              g.write_text(gs.rstrip("\n") + "\n" + HAPTICS)
+              print("patched: Globals.swift (legacy haptics)")
+
+          if errors:
+              print("PATCH FAILED:\n  " + "\n  ".join(errors))
+              sys.exit(1)
+          print("all patches applied")
+          PATCH_EOF
+          python3 /tmp/patch_ios12.py
+
+      - name: Build (unsigned, iOS 12.0, arm64)
+        run: |
+          xcodebuild -project DankPod.xcodeproj -target DankPod \
+            -configuration Release -sdk iphoneos \
+            SYMROOT="$PWD/build" \
+            IPHONEOS_DEPLOYMENT_TARGET=12.0 \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            SWIFT_ACTIVE_COMPILATION_CONDITIONS=IOS12 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Inspect binary
+        run: |
+          APP=build/Release-iphoneos/DankPod.app
+          echo "== load commands =="; otool -l "$APP/DankPod" | grep -A4 -E "LC_BUILD_VERSION|LC_VERSION_MIN|LC_DYLD_INFO_ONLY|LC_DYLD_CHAINED_FIXUPS" || true
+          echo "== linked libraries =="; otool -L "$APP/DankPod"
+          echo "== chkstk check =="; (nm -u "$APP/DankPod" | grep chkstk) && echo "WARNING: chkstk referenced" || echo "OK: no ___chkstk_darwin"
+          echo "== bundle =="; ls -la "$APP"; ls -la "$APP/Frameworks" 2>/dev/null || echo "(no Frameworks dir)"
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist"
+
+      - name: Zip app
+        run: cd build/Release-iphoneos && ditto -c -k --keepParent DankPod.app ../../DankPod-ios12.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DankPod-ios12
+          path: DankPod-ios12.zip
